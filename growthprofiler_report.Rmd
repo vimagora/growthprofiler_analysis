@@ -1,0 +1,821 @@
+---
+title: "261008_growthprofiler"
+subtitle: "Growth of IMK1010 and IMK1010-MSM expressing heterologous sugar transporters"
+author: "Victor M. Gonzalez Ramos"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 2
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    df_print: paged
+    code_folding: hide
+# Knit button: write the HTML into report_and_figures/ (next to the figures)
+knit: (function(input, ...) rmarkdown::render(input, output_dir = file.path(dirname(input), "report_and_figures")))
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  dpi = 100
+)
+```
+
+# Overview
+
+I analyzed GrowthProfiler growth curves of heterologous variants of
+*Saccharomyces cerevisiae* IMK1010 (a strain lacking most native hexose
+transporters and disaccharide hydrolases) and IMK1010-MSM (able to
+catabolize mannitol and sorbitol) to characterize substrate utilization
+following introduction of heterologous fungal sugar transporters. The genes
+of interest (GOI) are anonymized as GOI01, GOI02, ... in this public version.
+Every transporter is fused to yPet; the empty vector expresses free yPet.
+
+**Strains**
+
+IMK1010 background with pUDE453 vector:
+
+- **Empty vector (EV)** — no gene of interest (GOI).
+- **GOI01–GOI07** — heterologous fungal sugar transporters.
+- **hxt5** — positive control.
+
+IMK1010-MSM background with pUDE453 vector:
+
+- **Empty vector (EV)** — no gene of interest (GOI).
+- **GOI03, GOI04** — heterologous fungal sugar transporters.
+- **AnManSorST** — confirmed positive control.
+
+Two further transporters were discarded because they did not localize to the
+plasma membrane.
+
+**Substrates and concentrations (IMK1010 strains):** 5 substrates
+(ethanol, glucose, fructose, galactose, mannose) at 0.2% and 2% w/v,
+plus glucose and fructose at 8% and glucose at 0.5%.
+Ethanol was only tested at 2%.
+
+**Substrates and concentrations (IMK1010-MSM strains):**
+3 substrates (ethanol, mannitol, sorbitol) at 0.5%, 1% and 2% w/v.
+Ethanol was only tested at 2%.
+
+**Note:** Only the strains that showed growth are shown in the figures.
+
+## How to read this report
+
+| Section | Question it answers | Files |
+|---|---|---|
+| 3.1 Growth calls | Which strain grows on which substrate? | `report_and_figures/growth_calls.pdf` |
+| 3.2 Performance overview | How fast and how far does each strain grow, compared across all conditions? | `report_and_figures/overview.pdf` |
+| 3.3 yPet expression on ethanol | Are the transporters expressed, compared on one plate? | `report_and_figures/ypet_ethanol.pdf` |
+| 3.4 Substrate pages | Per substrate: all strains side by side, five growth parameters + transporter expression + growth curves | `report_and_figures/substrate_pages.pdf` |
+| 3.5 Parameter table | The numbers behind every figure | `tables/*.csv` |
+| Appendix | Quality check of every well and of µmax | `report_and_figures/qc_wells.pdf` |
+
+Every figure set is also saved as one SVG per page (editable text) in a
+folder of the same name, except the quality checks (PDF only).
+
+---
+
+# Data and methods
+
+```{r packages}
+library(tidyverse)
+library(growthrates)  # model-free µmax ("easylinear", Hall et al. 2014)
+library(patchwork)    # multi-panel pages
+library(ggh4x)        # fixed panel sizes
+library(ggpubr)       # theme_pubr
+library(svglite)      # SVG export with editable text
+library(knitr)
+```
+
+## Analysis parameters
+
+`selected_strains` and `selected_conditions` define which wells are
+analysed; everything else in the report follows from them.
+
+```{r analysis-parameters}
+# --- Selected strains and goi ---------------------------------------------
+# Only strains that showed growth in at least one condition are shown.
+
+selected_strains <- data.frame(host_strain= c("IMK1010", "IMK1010",  "IMK1010",
+                                              "IMK1010", "IMK1010", "IMK1010",
+                                              "IMK1010", "IMK1010", "IMK1010",
+                                              "IMK1010-MSM", "IMK1010-MSM",
+                                              "IMK1010-MSM", "IMK1010-MSM"),
+                               goi= c("EV", "GOI01", "GOI02",
+                                      "GOI03", "GOI04", "GOI05",
+                                      "GOI06", "GOI07", "hxt5",
+                                      "EV", "GOI03", "GOI04", "AnManSorST")) %>%
+  filter(host_strain %in% c("IMK1010", "IMK1010-MSM"),
+         goi %in% c("EV", "GOI03", "GOI04", "GOI05", "GOI07", "hxt5", "AnManSorST"))
+
+selected_conditions <- data.frame(substrate = c("ethanol",
+                                                 "glucose",  "glucose", "glucose",
+                                                 "fructose", "fructose", "fructose",
+                                                 "galactose", "galactose",
+                                                 "mannose", "mannose",
+                                                 "mannitol", "mannitol", "mannitol",
+                                                 "sorbitol", "sorbitol", "sorbitol"),
+                               concentration= c("2.00%",
+                                                "0.20%", "2.00%", "8.00%",
+                                                "0.20%", "2.00%", "8.00%",
+                                                "0.20%", "2.00%",
+                                                "0.20%", "2.00%",
+                                                "0.50%", "1.00%", "2.00%",
+                                                "0.50%", "1.00%", "2.00%"))
+
+# Positive control GOI per host strain
+POSITIVE_CONTROL <- c("IMK1010" = "hxt5", "IMK1010-MSM" = "AnManSorST")
+
+# --- Data processing ------------------------------------------------------
+MAX_TIME_H  <- 150.1  # time points after this (h) are dropped
+SMOOTH_K    <- 9      # rolling-median window for OD_smooth, in time points (1 point = 1 h); odd
+GROWTH_OD   <- 1      # a well "grows" if its smoothed OD reaches this; also "time to OD"
+MU_MIN_OD   <- 1      # growth rates use only OD >= this (see Methods)
+MU_WINDOW   <- 5      # sliding window for growth rates, in time points (5 h)
+MU_FRACTION <- 0.5    # deceleration = growth rate falls below this fraction of µmax
+
+# --- yPet fluorescence (end point, one Spark file per plate) ----------------
+YPET_RANGE  <- "A88:M95"  # 2nd reading (TF_GFP, ex 485 / em 530): plate rows A-H x columns 1-12
+
+# --- Output ---------------------------------------------------------------
+FIG_DIR   <- "report_and_figures"   # PDFs and SVGs (the knitted HTML goes here too)
+TABLE_DIR <- "tables"               # CSV tables
+```
+
+## Data
+
+```{r load-metadata}
+project_dir <- getwd()
+data_dir    <- file.path(project_dir,"raw_data")
+
+growthprofiler_md <- read_table(file.path(data_dir, "growthprofiler_MD.tsv")) %>%
+  filter(host_strain!="empty") %>%
+  inner_join(selected_conditions) %>%
+  inner_join(selected_strains)
+```
+
+```{r load-growth-data}
+data_clean_up <- function(plate_id) {
+  file_name <- paste0(plate_id, "_OD.csv")
+  file_path <- file.path(data_dir, "growth_profiler", file_name)
+
+  if (!file.exists(file_path)) {
+    stop("File not found: ", file_path)
+  }
+
+  raw_data <- read.csv(file_path, check.names = TRUE, skip = 33) %>%
+    rename("time_min"='Time..min.') %>%
+    select(-c("X","Input_Image")) %>%
+    mutate(time_h = time_min / 60) # Convert minutes -> decimal hours
+
+  # Pivot wide -> long, join metadata
+  long_data <- raw_data %>%
+    dplyr::select(-time_min) %>%
+    pivot_longer(
+      cols      = -time_h,
+      names_to  = "well",
+      values_to = "OD_gp"
+    ) %>%
+    mutate(plate_id = plate_id) %>%
+    inner_join(growthprofiler_md, by = c("plate_id", "well")) %>%   # drops empty wells
+    filter(!is.na(host_strain))                        # just to be sure to remove wells we missed with the empty label
+
+  return(long_data)
+}
+
+# Load all runs and stack
+run_ids <- unique(growthprofiler_md$plate_id)
+growth_data_raw <- map_dfr(run_ids, data_clean_up)
+
+# Final OD per well, for the fluorescence ratio: median of the last SMOOTH_K
+# readings of the whole run (fluorescence was read right after the run, so
+# this uses the time points after MAX_TIME_H too)
+final_od <- growth_data_raw %>%
+  group_by(plate_id, well) %>%
+  arrange(time_h, .by_group = TRUE) %>%
+  summarise(final_od = median(tail(OD_gp, SMOOTH_K)), .groups = "drop")
+
+# Per well: OD_smooth = rolling median of the raw OD; OD_bg = raw OD minus its
+# minimum (used for the AUC)
+growth_data_all <- growth_data_raw %>%
+  filter(time_h <= MAX_TIME_H) %>%
+  group_by(plate_id, well) %>%
+  arrange(time_h, .by_group = TRUE) %>%
+  mutate(OD_smooth = runmed(OD_gp, k = SMOOTH_K, endrule = "median"),
+         OD_bg     = OD_gp - min(OD_gp)) %>%
+  ungroup() %>%
+  mutate(plate = str_extract(plate_id, "MTP\\d+"))
+
+# Mean ± SD curve per strain x condition (for the growth-curve panels)
+growth_data_mean <- growth_data_all %>%
+  group_by(host_strain, goi, substrate, concentration, time_h) %>%
+  summarise(mean_OD = mean(OD_smooth), stdev_OD = sd(OD_smooth), .groups = "drop")
+```
+
+yPet fluorescence was read once per plate, right after the run, on a Tecan
+Spark. Only the second reading (TF_GFP, ex 485 / em 530) is used. The first
+reading (ex 510 / em 540) has a background of 35,000–55,000 even in EV wells
+and saturates, so it cannot separate yPet from background. Saturated wells
+("OVER") are left empty.
+
+```{r load-ypet}
+# One header row of the TF_GFP block, as text (row 67 = name, row 74 = gain)
+read_header_row <- function(file, row) {
+  readxl::read_excel(file, range = paste0("A", row, ":M", row), col_names = FALSE,
+                     col_types = "text", .name_repair = "minimal") %>%
+    unlist()
+}
+
+read_ypet <- function(file) {
+  stopifnot("TF_GFP" %in% read_header_row(file, 67))   # YPET_RANGE must be the TF_GFP reading
+  gain <- suppressWarnings(as.numeric(read_header_row(file, 74))) %>% na.omit() %>% first()
+  readxl::read_excel(file, range = YPET_RANGE, col_names = c("row", 1:12), col_types = "text") %>%
+    pivot_longer(-row, names_to = "column", values_to = "ypet_raw") %>%
+    transmute(plate = str_extract(basename(file), "MTP\\d+"),
+              well  = paste0(row, column),
+              ypet  = suppressWarnings(as.numeric(ypet_raw)),   # "OVER" (saturated) -> NA
+              gain  = gain)
+}
+
+ypet_data <- list.files(file.path(data_dir, "yPET_fluorescence"), pattern = "\\.xlsx$",
+                        full.names = TRUE) %>%
+  map_dfr(read_ypet)
+
+ypet_gain_text <- ypet_data %>%
+  distinct(plate, gain) %>%
+  arrange(plate) %>%
+  with(paste(plate, gain, collapse = ", "))
+```
+
+```{r figure-settings}
+# Strain order everywhere: EV, transporters, positive control.
+# Colours: controls grey (EV light, positive controls dark), transporters
+# Okabe-Ito (colour-blind safe). Each GOI has the same colour in both hosts.
+transporters <- setdiff(unique(selected_strains$goi), c("EV", POSITIVE_CONTROL))
+goi_levels   <- c("EV", transporters, unique(POSITIVE_CONTROL))
+okabe_ito    <- unname(palette.colors(palette = "Okabe-Ito")[c(6, 7, 4, 8, 2, 3, 5)])
+goi_colors   <- c(EV = "grey65",
+                  setNames(okabe_ito[seq_along(transporters)], transporters),
+                  setNames(rep("grey20", length(unique(POSITIVE_CONTROL))), unique(POSITIVE_CONTROL)))
+goi_labels   <- setNames(goi_levels, goi_levels)
+goi_labels["EV"] <- "EV (- ctrl)"
+goi_labels[unique(POSITIVE_CONTROL)] <- paste(unique(POSITIVE_CONTROL), "(+ ctrl)")
+
+host_gois <- function(strain) {
+  intersect(goi_levels, selected_strains$goi[selected_strains$host_strain == strain])
+}
+
+theme_gp <- theme_pubr(base_size = 10)
+
+# File-name label, e.g. "IMK1010_glucose"
+plot_name <- function(...) {
+  paste(..., sep = "_") %>%
+    str_replace_all("%", "pct") %>%
+    str_replace_all("[^A-Za-z0-9._-]+", "_")
+}
+
+# Draw a ggplot, or a page that was already laid out as a grob
+draw_plot <- function(p) {
+  if (is.ggplot(p)) print(p) else { grid::grid.newpage(); grid::grid.draw(p) }
+}
+
+# Write a named list of plots as one multi-page PDF (+ one SVG per plot)
+export_plots <- function(plots, set_name, width = 11, height = 8.5, svg = TRUE) {
+  dir.create(FIG_DIR, showWarnings = FALSE)
+  pdf(file.path(FIG_DIR, paste0(set_name, ".pdf")), width = width, height = height)
+  tryCatch(for (p in plots) draw_plot(p), finally = dev.off())   # always close the PDF
+  if (svg) {
+    svg_dir <- file.path(FIG_DIR, set_name)
+    dir.create(svg_dir, showWarnings = FALSE)
+    for (nm in names(plots)) {
+      ggsave(file.path(svg_dir, paste0(nm, ".svg")), plots[[nm]],
+             width = width, height = height, device = svglite::svglite)
+    }
+  }
+  invisible(plots)
+}
+
+# Print a named list of plots as tabs in the HTML report (chunk needs results='asis')
+show_plots <- function(plots) {
+  for (nm in names(plots)) {
+    tab_title <- nm %>% str_replace_all("pct", "%") %>% str_replace_all("_", " ")
+    cat("\n\n### ", tab_title, " {.unlisted .unnumbered}\n\n", sep = "")
+    draw_plot(plots[[nm]])
+    cat("\n\n")
+  }
+}
+```
+
+**`r nrow(growthprofiler_md)` wells** on `r n_distinct(growthprofiler_md$plate_id)`
+plates, 3 replicate wells per strain × condition. All replicate wells of a
+strain × condition are on the same plate, so they show the well-to-well
+spread, not the plate-to-plate spread.
+
+**Plate layout.** Strains are compared on the same plate except for the
+positive control hxt5, which was grown on other plates than the transporters
+for glucose, fructose, galactose and mannose. Differences between hxt5 and the
+transporters on those substrates may partly be plate effects. For yPet
+fluorescence the plates differ even more: the reader set its gain
+automatically per plate (`r ypet_gain_text`), so fluorescence values are
+comparable only within a plate. The substrate pages repeat this warning where
+it applies.
+
+```{r plate-layout}
+growthprofiler_md %>%
+  mutate(plate = str_extract(plate_id, "MTP\\d+"),
+         goi   = factor(goi, goi_levels)) %>%
+  group_by(host_strain, substrate, goi) %>%
+  summarise(plate = paste(sort(unique(plate)), collapse = " + "), .groups = "drop") %>%
+  arrange(goi) %>%
+  pivot_wider(names_from = goi, values_from = plate, values_fill = "") %>%
+  arrange(host_strain, substrate) %>%
+  kable(caption = "Plate of each strain × substrate")
+```
+
+## Growth parameters
+
+Five growth parameters are calculated for **every well** directly from its
+curve (no growth model), plus its yPet fluorescence per OD, then averaged per
+strain × condition. A well whose smoothed OD
+never reaches **OD `r GROWTH_OD`** counts as **no growth (n.g.)**: its rate and
+timing parameters are left empty instead of being set to 0.
+
+| Parameter | How it is calculated | What it says about the transporter |
+|---|---|---|
+| µmax (1/h) | Steepest straight stretch of log(OD) in a `r MU_WINDOW`-point window, extended to neighbouring windows within 95 % of that slope (`growthrates::fit_easylinear`, Hall *et al.* 2014) | Uptake capacity (Vmax) when transport limits growth |
+| Time to OD `r GROWTH_OD` (h) | First time point with smoothed OD ≥ `r GROWTH_OD` | How soon growth starts; robust single number |
+| Max OD | Highest smoothed OD | Whether the substrate is fully consumed and used efficiently |
+| Decel. start OD | Smoothed OD where the growth rate falls below `r MU_FRACTION * 100` % of µmax after the exponential phase | Early slowdown at low substrate suggests low affinity (high Km) |
+| AUC (OD x h) | Area under the measured, min-subtracted curve (trapezoid rule) | One number combining lag, rate and yield |
+| yPet / OD | yPet fluorescence / final OD; growing wells only | Transporter expression per cell: if a poorly growing strain still expresses its transporter, poor growth comes from poor transport, not poor expression |
+
+**yPet / OD** is in arbitrary units and comparable **only within a plate**
+(see the plate warning above). Points to keep in mind:
+
+- **EV is not a background control.** Its plasmid carries free (unfused) yPet,
+  so where EV grew (ethanol) its yPet / OD is the expression of the plasmid
+  without a transporter: a reference for the fusions, not something to
+  subtract.
+- **No background is subtracted.** The plates have no medium-only blanks. The
+  lowest wells read about 15–300 a.u., small next to the thousands of
+  growing wells.
+- **Cell autofluorescence is included in every value.** Measuring it would
+  need a strain without yPet (e.g. the host without plasmid) on each plate.
+- **Final OD, not max OD:** the median of the last `r SMOOTH_K` readings of
+  the run, the time closest to the fluorescence reading.
+- **Fluorescence per OD falls as cultures get denser,** because dense cultures
+  absorb and scatter part of the light. Compare strains that reached a similar
+  OD. A dilution series of a few cultures would show how linear the reading is.
+- **Expression is not localization.** Total fluorescence shows how much
+  transporter the cells make, not whether it reaches the plasma membrane; that
+  needs microscopy.
+
+**Growth rates use only OD ≥ `r MU_MIN_OD`.** The first readings of the wells
+scatter between about −0.1 and 0.5 around the true starting OD. On a log scale
+that offset makes every curve look steepest just above the baseline, which
+inflates µmax. Above OD `r MU_MIN_OD` the same offset changes log(OD) by only a
+few percent. The appendix shows the µmax tangent of every well. Lag and
+doubling time are not reported: lag needs the starting OD, which the
+GrowthProfiler cannot measure reliably, and doubling time is just ln(2)/µmax.
+
+```{r growth-parameters}
+# Growth rate in each sliding window of MU_WINDOW points: slope of log(OD) vs
+# time. OD below MU_MIN_OD is raised to MU_MIN_OD, so the baseline has slope 0.
+mu_series <- function(time_h, od) {
+  log_od      <- log(pmax(od, MU_MIN_OD))
+  windows     <- map(seq_len(length(od) - MU_WINDOW + 1), ~ .x:(.x + MU_WINDOW - 1))
+  window_time <- map_dbl(windows, ~ mean(time_h[.x]))
+  window_mu   <- map_dbl(windows, ~ cov(time_h[.x], log_od[.x]) / var(time_h[.x]))
+  tibble(time_h = window_time, mu = window_mu)
+}
+
+well_parameters <- function(well_data) {
+  d      <- arrange(well_data, time_h)
+  max_od <- max(d$OD_smooth)
+  params <- tibble(grows = max_od >= GROWTH_OD, max_od = max_od,
+                   auc =sum(diff(d$time_h) * (head(d$OD_bg, -1) + tail(d$OD_bg, -1)) / 2),
+                   mu_max = NA_real_, time_to_od = NA_real_, decel_od = NA_real_,
+                   y0_lm = NA_real_, fit_start = NA_real_, fit_end = NA_real_)
+  if (!params$grows) return(params)
+
+  params$time_to_od <- d$time_h[which(d$OD_smooth >= GROWTH_OD)[1]]
+
+  # µmax and its tangent line (growthrates "easylinear")
+  el     <- suppressWarnings(fit_easylinear(d$time_h, pmax(d$OD_smooth, MU_MIN_OD), h = MU_WINDOW))
+  el_par <- coef(el)
+  if (!is.finite(el_par[["mumax"]]) || el_par[["mumax"]] <= 0) return(params)
+
+  # Deceleration: first window after the fastest one where the growth rate
+  # drops below MU_FRACTION x µmax (NA if the well is still growing at the end)
+  mu   <- mu_series(d$time_h, d$OD_smooth)
+  fast <- mu$mu >= MU_FRACTION * el_par[["mumax"]]
+  end  <- which.max(mu$mu)
+  while (end < nrow(mu) && fast[end + 1]) end <- end + 1
+  decel_time <- if (end < nrow(mu)) mu$time_h[end + 1] else NA_real_
+
+  params %>% mutate(
+    mu_max    = el_par[["mumax"]],
+    decel_od  = if (is.na(decel_time)) NA_real_ else approx(d$time_h, d$OD_smooth, decel_time)$y,
+    y0_lm     = el_par[["y0_lm"]],                 # tangent line, for the QC plots
+    fit_start = d$time_h[min(el@ndx)],
+    fit_end   = d$time_h[max(el@ndx)]
+  )
+}
+
+growth_params <- growth_data_all %>%
+  select(plate_id, well, time_h, OD_smooth, OD_bg) %>%
+  nest(.by = c(plate_id, well), .key = "well_data") %>%
+  mutate(params = map(well_data, well_parameters)) %>%
+  select(-well_data) %>%
+  unnest(params) %>%
+  left_join(growthprofiler_md, by = c("plate_id", "well")) %>%
+  mutate(plate = str_extract(plate_id, "MTP\\d+")) %>%
+  relocate(plate_id, plate, well, host_strain, goi, substrate, concentration)
+
+# yPet per OD: fluorescence / final OD, for growing wells only
+growth_params <- growth_params %>%
+  left_join(final_od, by = c("plate_id", "well")) %>%
+  left_join(ypet_data, by = c("plate", "well")) %>%
+  mutate(ypet_per_od = if_else(grows, ypet / final_od, NA_real_))
+
+# Parameters in plot order, with labels and label precision
+param_info <- tribble(
+  ~param,        ~label,                                 ~digits,
+  "mu_max",      "µmax (1/h)",                            2,
+  "time_to_od",  paste0("Time to OD ", GROWTH_OD, " (h)"), 0,
+  "max_od",      "Max OD",                                1,
+  "decel_od",    "Decel. start OD",                       1,
+  "auc",         "AUC (OD x h)",                          0,
+  "ypet_per_od", "yPet / OD (a.u.)",                      0
+)
+
+# Mean ± SD per strain x condition. n = wells with a value; n_growing / n_wells
+# tells whether all replicates grew.
+param_summary <- growth_params %>%
+  pivot_longer(all_of(param_info$param), names_to = "param", values_to = "value") %>%
+  group_by(host_strain, goi, substrate, concentration, plate, param) %>%
+  summarise(n_wells = n(), n_growing = sum(grows), n = sum(!is.na(value)),
+            mean = if (n > 0) mean(value, na.rm = TRUE) else NA_real_,
+            sd   = sd(value, na.rm = TRUE), .groups = "drop")
+
+dir.create(TABLE_DIR, showWarnings = FALSE)
+write_csv(select(growth_params, -c(y0_lm, fit_start, fit_end)),
+          file.path(TABLE_DIR, "growth_parameters_per_well.csv"))
+write_csv(param_summary, file.path(TABLE_DIR, "growth_parameters_summary.csv"))
+```
+
+---
+
+# Results
+
+## Growth calls
+
+Number of replicate wells that reached OD `r GROWTH_OD`, per strain and
+condition. EV (negative control) shows the background growth of the host;
+growth above EV is enabled by the transporter.
+
+```{r growth-calls, fig.width=11, fig.height=5.5}
+# Tile layout shared by the growth calls and the overview heat maps:
+# strains as rows, concentrations as columns, one block per substrate
+tile_layout <- function(title) {
+  list(facet_grid(~ substrate, scales = "free_x", space = "free_x"),
+       scale_y_discrete(limits = rev, labels = goi_labels),
+       labs(title = title, x = NULL, y = NULL),
+       theme_gp,
+       theme(axis.line = element_blank(), axis.ticks = element_blank(),
+             legend.position = "right", strip.background = element_blank(),
+             strip.text = element_text(face = "bold")))
+}
+
+growth_calls <- growth_params %>%
+  group_by(host_strain, goi, substrate, concentration) %>%
+  summarise(n_grow = sum(grows), n = n(), .groups = "drop") %>%
+  mutate(goi = factor(goi, goi_levels),
+         text_col = if_else(n_grow / n > 0.5, "white", "black"))
+
+growth_call_plot <- function(strain) {
+  ggplot(filter(growth_calls, host_strain == strain), aes(x = concentration, y = goi)) +
+    geom_tile(aes(fill = n_grow / n), color = "white", linewidth = 1) +
+    geom_text(aes(label = paste0(n_grow, "/", n), color = text_col), size = 3.2) +
+    scale_fill_gradient(low = "grey92", high = "#0072B2", limits = c(0, 1),
+                        labels = scales::percent, name = "Wells grown") +
+    scale_color_identity() +
+    tile_layout(strain)
+}
+
+growth_call_page <- map(names(POSITIVE_CONTROL), growth_call_plot) %>%
+  wrap_plots(ncol = 1, heights = map_int(names(POSITIVE_CONTROL), ~ length(host_gois(.x)))) +
+  plot_annotation(title = paste("Growth calls: wells reaching OD", GROWTH_OD))
+
+export_plots(list(growth_calls = growth_call_page), "growth_calls", height = 5.5)
+growth_call_page
+```
+
+## Performance overview {.tabset .tabset-pills}
+
+The three parameters that best separate the strains, per strain × condition.
+Colours run from low (dark) to high (bright) for µmax and max OD, and from
+slow (dark) to fast (bright) for time to OD `r GROWTH_OD`, so **bright is
+always better**.
+
+- **µmax and time to OD `r GROWTH_OD`:** mean of the growing wells. Grey =
+  no growth; **\*** = not all replicate wells grew.
+- **Max OD:** mean of all wells, so it also shows how little the
+  non-growing strains grew.
+
+```{r overview, fig.width=11, fig.height=8.5}
+heat_plot <- function(strain, p) {
+  info  <- filter(param_info, param == p)
+  lower_is_better <- p == "time_to_od"
+  d <- param_summary %>%
+    filter(host_strain == strain, param == p) %>%
+    mutate(goi   = factor(goi, goi_levels),
+           label = case_when(n == 0 ~ "n.g.",
+                             TRUE   ~ paste0(format(round(mean, info$digits), nsmall = info$digits),
+                                             if_else(n < n_wells, "*", ""))),
+           shade = scales::rescale(if (lower_is_better) -mean else mean),
+           text_col = if_else(!is.na(shade) & shade < 0.5, "white", "black"))
+  ggplot(d, aes(x = concentration, y = goi)) +
+    geom_tile(aes(fill = mean), color = "white", linewidth = 1) +
+    geom_text(aes(label = label, color = text_col), size = 3) +
+    scale_fill_viridis_c(direction = if (lower_is_better) -1 else 1,
+                         na.value = "grey85", name = NULL) +
+    scale_color_identity() +
+    tile_layout(info$label)
+}
+
+overview_page <- function(strain) {
+  map(c("mu_max", "time_to_od", "max_od"), ~ heat_plot(strain, .x)) %>%
+    wrap_plots(ncol = 1) +
+    plot_annotation(title = paste(strain, "- performance overview"),
+                    subtitle = paste("µmax and time to OD: mean of growing wells (n.g. = no growth,",
+                                     "* = not all replicates grew); max OD: mean of all wells"))
+}
+
+overview_pages <- map(names(POSITIVE_CONTROL), overview_page) %>%
+  set_names(plot_name(names(POSITIVE_CONTROL)))
+
+export_plots(overview_pages, "overview")
+```
+
+```{r overview-show, results='asis', echo=FALSE, fig.width=11, fig.height=8.5}
+show_plots(overview_pages)
+```
+
+## yPet expression on ethanol
+
+On ethanol every strain grew to a similar OD, and all strains were on one
+plate read with one gain, so this is the one condition where transporter
+expression can be compared across all strains. EV carries free yPet from the
+same plasmid, so its yPet / OD (dashed line) is the reference: the expression
+of the plasmid without a transporter attached.
+
+```{r ypet-ethanol, fig.width=11, fig.height=5}
+ypet_ethanol <- growth_params %>%
+  filter(substrate == "ethanol", !is.na(ypet)) %>%
+  mutate(ratio = ypet / final_od, goi = factor(goi, goi_levels))
+
+ypet_ethanol_sum <- ypet_ethanol %>%
+  group_by(host_strain, goi) %>%
+  summarise(final_od = mean(final_od), mean = mean(ratio), sd = sd(ratio), .groups = "drop") %>%
+  group_by(host_strain) %>%
+  mutate(ev = mean[goi == "EV"], fold_ev = mean / ev) %>%
+  ungroup()
+
+ypet_ethanol_plot <- ggplot(ypet_ethanol_sum, aes(x = goi, y = mean, fill = goi)) +
+  geom_col(width = 0.75) +
+  geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd), width = 0.25) +
+  geom_point(data = ypet_ethanol, aes(y = ratio), shape = 21, fill = "white", size = 1.5,
+             position = position_jitter(width = 0.12, seed = 1)) +
+  geom_hline(aes(yintercept = ev), linetype = "dashed", color = "grey40") +
+  facet_grid(~ host_strain, scales = "free_x", space = "free_x") +
+  scale_fill_manual(values = goi_colors, guide = "none") +
+  scale_x_discrete(labels = goi_labels) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "yPet fluorescence per OD on ethanol 2% (one plate, one gain)",
+       subtitle = "yPet / final OD; dashed line = EV (free yPet, no transporter)",
+       x = NULL, y = "yPet / final OD (a.u.)") +
+  theme_gp +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+
+export_plots(list(ypet_ethanol = ypet_ethanol_plot), "ypet_ethanol", height = 5)
+ypet_ethanol_plot
+
+ypet_ethanol_sum %>%
+  transmute(host_strain, goi = goi_labels[as.character(goi)], final_od = round(final_od, 1),
+            `yPet / OD` = paste(round(mean), "±", round(sd)), `x EV` = round(fold_ev, 2)) %>%
+  kable(caption = "yPet per OD on ethanol, relative to EV")
+```
+
+Across the strains with a transporter, yPet / OD on ethanol is
+**`r round(min(ypet_ethanol_sum$fold_ev[ypet_ethanol_sum$goi != "EV"]), 2)`–`r round(max(ypet_ethanol_sum$fold_ev[ypet_ethanol_sum$goi != "EV"]), 2)` × EV**.
+Values around 1 mean the transporter fusion gives about as much fluorescence
+per cell as free yPet from the same plasmid: the fusions are expressed, at
+comparable levels. Two limits:
+
+- **Autofluorescence is in every bar.** It pulls all values towards each
+  other, so real differences may be larger than shown.
+- **This is expression on ethanol only.** If the promoter responds to the
+  carbon source, expression on the sugars can differ; the substrate pages
+  show it per condition.
+
+## Substrate pages {.tabset .tabset-pills}
+
+One page per host strain × substrate, all strains side by side (EV,
+transporters, positive control).
+
+- **Six parameter panels:** bars = mean ± SD of the replicate wells, points =
+  individual wells, **×** = no growth. The last panel is the transporter
+  expression, yPet / final OD. EV carries free yPet, so where EV grew
+  (ethanol) its bar is the plasmid's expression without a transporter.
+- **Bottom row:** mean ± SD growth curves per concentration. The dotted line
+  is OD `r GROWTH_OD`.
+- A **plate warning** in the subtitle marks pages where the positive control
+  was on a different plate.
+
+```{r substrate-pages}
+theme_page <- theme_pubr(base_size = 9)
+
+# Same bar width and curve-panel width on every page
+n_slots <- growth_params %>%
+  distinct(host_strain, substrate, concentration) %>%
+  count(host_strain, substrate) %>%
+  pull(n) %>%
+  max()
+
+substrate_page <- function(strain, subs) {
+  control <- POSITIVE_CONTROL[[strain]]
+  gois    <- host_gois(strain)
+  cols    <- goi_colors[gois]
+  concs   <- sort(unique(growth_params$concentration[growth_params$host_strain == strain &
+                                                     growth_params$substrate == subs]))
+  slot_pad <- (n_slots - length(concs)) / 2 + 0.6
+
+  wells <- growth_params %>%
+    filter(host_strain == strain, substrate == subs) %>%
+    mutate(goi = factor(goi, gois))
+  sums  <- param_summary %>%
+    filter(host_strain == strain, substrate == subs) %>%
+    mutate(goi = factor(goi, gois),
+           ng_y = if_else(n_growing == 0, 0, NA_real_))   # "no growth" cross (not for a value that is missing for other reasons)
+
+  # Every layer keeps all strains (empty values are dropped only when drawn),
+  # so points and crosses land on their own strain's bar
+  dodge <- position_dodge(width = 0.85)
+  bar_panel <- function(p, title) {
+    ggplot(filter(sums, param == p), aes(x = concentration, y = mean, fill = goi)) +
+      geom_col(position = dodge, width = 0.8, na.rm = TRUE) +
+      geom_errorbar(aes(ymin = mean - sd, ymax = mean + sd),
+                    position = dodge, width = 0.3, linewidth = 0.3, na.rm = TRUE) +
+      geom_point(data = wells, aes(y = .data[[p]], group = goi), position = dodge,
+                 shape = 21, fill = "white", size = 0.8, stroke = 0.3, na.rm = TRUE) +
+      geom_point(aes(y = ng_y, group = goi), position = dodge,
+                 shape = 4, size = 1.2, na.rm = TRUE) +
+      scale_fill_manual(values = cols) +
+      scale_x_discrete(expand = expansion(add = slot_pad)) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.1))) +
+      expand_limits(y = 0) +
+      labs(title = title, x = NULL, y = NULL) +
+      guides(fill = "none") +          # colours are explained by the curve legend
+      theme_page
+  }
+  bars <- map2(param_info$param, param_info$label, bar_panel)
+
+  curve_data <- growth_data_mean %>%
+    filter(host_strain == strain, substrate == subs) %>%
+    mutate(goi = factor(goi, gois))
+  y_max <- max(curve_data$mean_OD + curve_data$stdev_OD, na.rm = TRUE)
+  curve_panel <- function(conc) {
+    ggplot(filter(curve_data, concentration == conc),
+           aes(x = time_h, y = mean_OD, color = goi, fill = goi)) +
+      geom_ribbon(aes(ymin = mean_OD - stdev_OD, ymax = mean_OD + stdev_OD),
+                  alpha = 0.15, color = NA) +
+      geom_line(linewidth = 0.5) +
+      geom_hline(yintercept = GROWTH_OD, linetype = "dotted", color = "grey40") +
+      scale_color_manual(values = cols, labels = goi_labels, name = NULL, drop = FALSE) +
+      scale_fill_manual(values = cols, labels = goi_labels, name = NULL, drop = FALSE) +
+      coord_cartesian(ylim = c(0, y_max)) +
+      labs(title = conc, x = "Time (h)", y = "OD (smoothed)") +
+      theme_page
+  }
+  curves <- c(map(concs, curve_panel),
+              rep(list(plot_spacer()), n_slots - length(concs)))   # keep curves under their bar columns
+
+  # Warn when the positive control was on another plate than the other strains
+  plates      <- distinct(wells, goi, plate)
+  ctrl_plate  <- sort(unique(plates$plate[plates$goi == control]))
+  other_plate <- sort(unique(plates$plate[plates$goi != control]))
+  plate_note  <- if (setequal(ctrl_plate, other_plate)) "" else
+    paste0("\nPlate warning: ", control, " on ", paste(ctrl_plate, collapse = " + "),
+           ", the other strains on ", paste(other_plate, collapse = " + "),
+           ". Compare its growth with care and its yPet / OD not at all (different reader gain).")
+
+  wrap_plots(c(bars, curves), ncol = 3, heights = c(1, 1, 1.3), guides = "collect") +
+    plot_annotation(
+      title    = paste(strain, "on", subs),
+      subtitle = paste0("Mean ± SD of replicate wells, points = wells, x = no growth (OD < ",
+                        GROWTH_OD, ")", plate_note),
+      theme    = theme(plot.title = element_text(size = 13, face = "bold"))) &
+    theme(legend.position = "bottom")
+}
+
+substrate_index <- growth_params %>%
+  distinct(host_strain, substrate) %>%
+  arrange(host_strain, substrate)
+
+# Laying out a multi-panel page is slow, so each page is laid out once (as a
+# grob) and that grob is reused for the PDF, the SVG and the HTML
+substrate_pages <- map2(substrate_index$host_strain, substrate_index$substrate, substrate_page) %>%
+  map(patchworkGrob) %>%
+  set_names(plot_name(substrate_index$host_strain, substrate_index$substrate))
+
+export_plots(substrate_pages, "substrate_pages")
+```
+
+```{r substrate-pages-show, results='asis', echo=FALSE, fig.width=11, fig.height=8.5}
+show_plots(substrate_pages)
+```
+
+## Parameter table
+
+Mean ± SD of the replicate wells; **n.g.** = no well grew. *Grown* = growing
+wells / all wells. Also saved as `r TABLE_DIR`/growth_parameters_summary.csv
+(and per well: growth_parameters_per_well.csv).
+
+```{r parameter-table}
+param_summary %>%
+  mutate(value = case_when(n == 0 ~ "n.g.",
+                           n == 1 ~ as.character(signif(mean, 3)),
+                           TRUE   ~ paste(signif(mean, 3), "±", signif(sd, 2))),
+         param = factor(param, param_info$param, param_info$label),
+         grown = paste0(n_growing, "/", n_wells),
+         goi   = factor(goi, goi_levels)) %>%
+  select(host_strain, substrate, concentration, goi, plate, grown, param, value) %>%
+  pivot_wider(names_from = param, values_from = value) %>%
+  arrange(host_strain, substrate, concentration, goi)
+```
+
+---
+
+# Appendix: quality check {.tabset .tabset-pills}
+
+Every well of every condition on a **log scale**: points = raw OD, line =
+smoothed OD, dashed = µmax tangent (a straight line on this scale is
+exponential growth). The dotted line is OD `r MU_MIN_OD`; growth rates use only
+the curve above it. Check here for artefacts (spikes, jumps, a replicate that
+behaves differently) and that each tangent follows the steepest straight part
+of its well. PDF only: `r FIG_DIR`/qc_wells.pdf.
+
+```{r qc-wells}
+qc_plot <- function(strain, subs, conc) {
+  wells    <- growth_data_all %>%
+    filter(host_strain == strain, substrate == subs, concentration == conc) %>%
+    mutate(goi = factor(goi, host_gois(strain)))
+  tangents <- growth_params %>%
+    filter(host_strain == strain, substrate == subs, concentration == conc, !is.na(mu_max)) %>%
+    mutate(goi = factor(goi, host_gois(strain)),
+           t1 = fit_start - 5, t2 = fit_end + 5,
+           y1 = y0_lm * exp(mu_max * t1), y2 = y0_lm * exp(mu_max * t2))
+  ggplot(wells, aes(x = time_h, color = well)) +
+    geom_point(aes(y = pmax(OD_gp, 0.01)), size = 0.3, alpha = 0.4) +
+    geom_line(aes(y = pmax(OD_smooth, 0.01)), linewidth = 0.5) +
+    geom_segment(data = tangents, aes(x = t1, xend = t2, y = y1, yend = y2),
+                 linetype = "dashed", linewidth = 0.6) +
+    geom_hline(yintercept = MU_MIN_OD, linetype = "dotted") +
+    scale_y_log10() +
+    facet_wrap(~ goi, ncol = 3, labeller = as_labeller(goi_labels)) +
+    force_panelsizes(cols = unit(2.6, "in"), rows = unit(2.6, "in")) +
+    labs(x = "Time (h)", y = "OD (log scale)", color = "Well",
+         title = paste("QC -", strain, subs, conc),
+         subtitle = "Points: raw OD; line: smoothed OD; dashed: µmax tangent; dotted: lowest OD used for growth rates") +
+    theme_gp +
+    theme(legend.position = "right")
+}
+
+qc_index <- growth_params %>%
+  distinct(host_strain, substrate, concentration) %>%
+  arrange(host_strain, substrate, concentration)
+
+qc_plots <- pmap(list(qc_index$host_strain, qc_index$substrate, qc_index$concentration), qc_plot) %>%
+  set_names(plot_name(qc_index$host_strain, qc_index$substrate, qc_index$concentration))
+
+export_plots(qc_plots, "qc_wells", svg = FALSE)
+```
+
+```{r qc-wells-show, results='asis', echo=FALSE, fig.width=11, fig.height=8.5}
+show_plots(qc_plots)
+```
+
+---
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```
